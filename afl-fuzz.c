@@ -71,6 +71,16 @@
 #include "aflnet.h"
 #include "aflnet-nfl.h"
 #include <graphviz/gvc.h>
+
+/* Older graphviz/cgraph headers defined FALSE/TRUE; newer ones (used by the
+   agnode/agedge "create" flag below) no longer do. Provide them if missing so
+   the IPSM dot-graph code builds across graphviz versions. */
+#ifndef FALSE
+#define FALSE 0
+#endif
+#ifndef TRUE
+#define TRUE 1
+#endif
 #include <math.h>
 
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined (__OpenBSD__)
