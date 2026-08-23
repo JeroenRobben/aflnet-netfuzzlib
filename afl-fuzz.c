@@ -69,6 +69,7 @@
 #include <sys/capability.h>
 
 #include "aflnet.h"
+#include "aflnet-nfl.h"
 #include <graphviz/gvc.h>
 #include <math.h>
 
@@ -371,7 +372,9 @@ u32 state_ids_count = 0;
 u32 selected_state_index = 0;
 u32 state_cycles = 0;
 u32 messages_sent = 0;
-EXP_ST u8 session_virgin_bits[MAP_SIZE];     /* Regions yet untouched while the SUT is still running */
+/* netfuzzlib: pointers into shm attached at startup. response_buf and
+   response_bytes above are repointed into shm by attach_aflnet_nfl_response_shmem. */
+static u32 *nfl_messages_sent_ptr = NULL;
 EXP_ST u8 *cleanup_script; /* script to clean up the environment of the SUT -- make fuzzing more deterministic */
 EXP_ST u8 *netns_name; /* network namespace name to run server in */
 char **was_fuzzed_map = NULL; /* A 2D array keeping state-specific was_fuzzed information */
@@ -526,7 +529,9 @@ void update_region_annotations(struct queue_entry* q)
 {
   u32 i = 0;
 
-  for (i = 0; i < messages_sent; i++) {
+  /* messages_sent comes from the (shared) response shmem; never index past the
+     region array even if it is out of range. */
+  for (i = 0; i < messages_sent && i < q->region_count; i++) {
     if ((response_bytes[i] == 0) || ( i > 0 && (response_bytes[i] - response_bytes[i - 1] == 0))) {
       q->regions[i].state_sequence = NULL;
       q->regions[i].state_count = 0;
@@ -983,140 +988,8 @@ void update_state_aware_variables(struct queue_entry *q, u8 dry_run)
 /* Send (mutated) messages in order to the server under test */
 int send_over_network()
 {
-  int n;
-  u8 likely_buggy = 0;
-  struct sockaddr_in serv_addr;
-  struct sockaddr_in local_serv_addr;
-
-  //Clean up the server if needed
-  if (cleanup_script) system(cleanup_script);
-
-  //Wait a bit for the server initialization
-  usleep(server_wait_usecs);
-
-  //Clear the response buffer and reset the response buffer size
-  if (response_buf) {
-    ck_free(response_buf);
-    response_buf = NULL;
-    response_buf_size = 0;
-  }
-
-  if (response_bytes) {
-    ck_free(response_bytes);
-    response_bytes = NULL;
-  }
-
-  //Create a TCP/UDP socket
-  int sockfd = -1;
-  if (net_protocol == PRO_TCP)
-    sockfd = socket(AF_INET, SOCK_STREAM, 0);
-  else if (net_protocol == PRO_UDP)
-    sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-
-  if (sockfd < 0) {
-    PFATAL("Cannot create a socket");
-  }
-
-  //Set timeout for socket data sending/receiving -- otherwise it causes a big delay
-  //if the server is still alive after processing all the requests
-  struct timeval timeout;
-  timeout.tv_sec = 0;
-  timeout.tv_usec = socket_timeout_usecs;
-  setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, (char *)&timeout, sizeof(timeout));
-
-  memset(&serv_addr, '0', sizeof(serv_addr));
-
-  serv_addr.sin_family = AF_INET;
-  serv_addr.sin_port = htons(net_port);
-  serv_addr.sin_addr.s_addr = inet_addr(net_ip);
-
-  //This piece of code is only used for targets that send responses to a specific port number
-  //The Kamailio SIP server is an example. After running this code, the intialized sockfd 
-  //will be bound to the given local port
-  if(local_port > 0) {
-    local_serv_addr.sin_family = AF_INET;
-    local_serv_addr.sin_addr.s_addr = INADDR_ANY;
-    local_serv_addr.sin_port = htons(local_port);
-
-    local_serv_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-    if (bind(sockfd, (struct sockaddr*) &local_serv_addr, sizeof(struct sockaddr_in)))  {
-      FATAL("Unable to bind socket on local source port");
-    }
-  }
-
-  if(connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-    //If it cannot connect to the server under test
-    //try it again as the server initial startup time is varied
-    for (n=0; n < 1000; n++) {
-      if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) == 0) break;
-      usleep(1000);
-    }
-    if (n== 1000) {
-      close(sockfd);
-      return 1;
-    }
-  }
-
-  //retrieve early server response if needed
-  if (net_recv(sockfd, timeout, poll_wait_msecs, &response_buf, &response_buf_size)) goto HANDLE_RESPONSES;
-
-  //write the request messages
-  kliter_t(lms) *it;
-  messages_sent = 0;
-
-  for (it = kl_begin(kl_messages); it != kl_end(kl_messages); it = kl_next(it)) {
-    n = net_send(sockfd, timeout, kl_val(it)->mdata, kl_val(it)->msize);
-    messages_sent++;
-
-    //Allocate memory to store new accumulated response buffer size
-    response_bytes = (u32 *) ck_realloc(response_bytes, messages_sent * sizeof(u32));
-
-    //Jump out if something wrong leading to incomplete message sent
-    if (n != kl_val(it)->msize) {
-      goto HANDLE_RESPONSES;
-    }
-
-    //retrieve server response
-    u32 prev_buf_size = response_buf_size;
-    if (net_recv(sockfd, timeout, poll_wait_msecs, &response_buf, &response_buf_size)) {
-      goto HANDLE_RESPONSES;
-    }
-
-    //Update accumulated response buffer size
-    response_bytes[messages_sent - 1] = response_buf_size;
-
-    //set likely_buggy flag if AFLNet does not receive any feedback from the server
-    //it could be a signal of a potentiall server crash, like the case of CVE-2019-7314
-    if (prev_buf_size == response_buf_size) likely_buggy = 1;
-    else likely_buggy = 0;
-  }
-
-HANDLE_RESPONSES:
-
-  net_recv(sockfd, timeout, poll_wait_msecs, &response_buf, &response_buf_size);
-
-  if (messages_sent > 0 && response_bytes != NULL) {
-    response_bytes[messages_sent - 1] = response_buf_size;
-  }
-
-  //wait a bit letting the server to complete its remaining task(s)
-  memset(session_virgin_bits, 255, MAP_SIZE);
-  while(1) {
-    if (has_new_bits(session_virgin_bits) != 2) break;
-  }
-
-  close(sockfd);
-
-  if (likely_buggy && false_negative_reduction) return 0;
-
-  if (terminate_child && (child_pid > 0)) kill(child_pid, SIGTERM);
-
-  //give the server a bit more time to gracefully terminate
-  while(1) {
-    int status = kill(child_pid, 0);
-    if ((status != 0) && (errno == ESRCH)) break;
-  }
-
+  /* netfuzzlib mode: all I/O happens in-process inside the preloaded module.
+     afl-fuzz only syncs messages (run_target) and reads responses back. */
   return 0;
 }
 /* End of AFLNet-specific variables & functions */
@@ -3160,6 +3033,10 @@ static u8 run_target(char** argv, u32 timeout) {
      territory. */
 
   memset(trace_bits, 0, MAP_SIZE);
+  if (use_net) {
+    reset_response_shmem();
+    sync_messages_to_shmem(kl_messages);
+  }
   MEM_BARRIER();
 
   /* If we're running in "dumb" mode, we can't rely on the fork server
@@ -3301,6 +3178,7 @@ static u8 run_target(char** argv, u32 timeout) {
   }
 
   if (!WIFSTOPPED(status)) child_pid = 0;
+  if (use_net) readback_response_shmem(&messages_sent, &response_buf_size);
 
   getitimer(ITIMER_REAL, &it);
   exec_ms = (u64) timeout - (it.it_value.tv_sec * 1000 +
@@ -9254,6 +9132,12 @@ int main(int argc, char** argv) {
   if (!out_file) setup_stdio_file();
 
   check_binary(argv[optind]);
+  if (use_net) {
+    int *rb_unused_sz = NULL;
+    setup_aflnet_nfl(net_protocol, net_ip, net_port, local_port);
+    attach_aflnet_nfl_response_shmem(&response_buf, &rb_unused_sz,
+                                     &response_bytes, &nfl_messages_sent_ptr);
+  }
 
   start_time = get_cur_time();
 

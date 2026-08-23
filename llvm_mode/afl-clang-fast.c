@@ -281,6 +281,12 @@ static void edit_params(u32 argc, char** argv) {
 
   if (maybe_linking) {
 
+    /* Export __afl_manual_init into the dynamic symbol table so an
+       LD_PRELOAD/AFL_PRELOAD library (e.g. the netfuzzlib module) can resolve
+       it and drive the deferred forkserver via __AFL_DEFER_FORKSRV. Without
+       this the weak reference resolves to NULL and deferral silently no-ops. */
+    cc_params[cc_par_cnt++] = "-Wl,--export-dynamic-symbol=__afl_manual_init";
+
     if (x_set) {
       cc_params[cc_par_cnt++] = "-x";
       cc_params[cc_par_cnt++] = "none";

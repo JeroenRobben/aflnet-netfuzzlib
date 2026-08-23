@@ -1,0 +1,3 @@
+[submodule "third_party/netfuzzlib"]
+	path = third_party/netfuzzlib
+	url = https://github.com/JeroenRobben/netfuzzlib.git
